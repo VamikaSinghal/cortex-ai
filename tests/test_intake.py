@@ -196,3 +196,85 @@ def test_staged_files_exist_after_202(tmp_path, monkeypatch):
 
     staged_images = [f for f in batch_dir.iterdir() if f.suffix == ".png"]
     assert len(staged_images) == 2
+
+
+# ── 8.12 session_id stored in meta ───────────────────────────────────────────
+
+def test_session_id_stored_in_meta(tmp_path, monkeypatch):
+    import intake_api
+    monkeypatch.setattr(intake_api, "STAGING_DIR", tmp_path / "staging")
+
+    resp = post_batch([ts_image(NOW)], extra_data={"session_id": "test-sess-001"})
+    assert resp.status_code == 202
+    meta = json.loads((tmp_path / "staging" / resp.json()["batch_id"] / "meta.json").read_text())
+    assert meta["session_id"] == "test-sess-001"
+
+
+def test_session_id_null_when_omitted(tmp_path, monkeypatch):
+    import intake_api
+    monkeypatch.setattr(intake_api, "STAGING_DIR", tmp_path / "staging")
+
+    resp = post_batch([ts_image(NOW)])
+    assert resp.status_code == 202
+    meta = json.loads((tmp_path / "staging" / resp.json()["batch_id"] / "meta.json").read_text())
+    assert meta["session_id"] is None
+
+
+# ── 8.13 transcript_offset stored in meta ────────────────────────────────────
+
+def test_transcript_offset_stored_in_meta(tmp_path, monkeypatch):
+    import intake_api
+    monkeypatch.setattr(intake_api, "STAGING_DIR", tmp_path / "staging")
+
+    transcript = json.dumps([
+        {"speaker": "A", "text": "t0", "timestamp": NOW},
+        {"speaker": "B", "text": "t1", "timestamp": NOW + 1},
+        {"speaker": "A", "text": "t2", "timestamp": NOW + 2},
+        {"speaker": "B", "text": "t3", "timestamp": NOW + 3},
+    ])
+    resp = post_batch([ts_image(NOW)], transcript=transcript, extra_data={"transcript_offset": "3"})
+    assert resp.status_code == 202
+    meta = json.loads((tmp_path / "staging" / resp.json()["batch_id"] / "meta.json").read_text())
+    assert meta["transcript_offset"] == 3
+
+
+def test_transcript_offset_defaults_to_zero(tmp_path, monkeypatch):
+    import intake_api
+    monkeypatch.setattr(intake_api, "STAGING_DIR", tmp_path / "staging")
+
+    resp = post_batch([ts_image(NOW)])
+    assert resp.status_code == 202
+    meta = json.loads((tmp_path / "staging" / resp.json()["batch_id"] / "meta.json").read_text())
+    assert meta["transcript_offset"] == 0
+
+
+def test_transcript_offset_invalid_returns_400():
+    resp = post_batch([ts_image(NOW)], extra_data={"transcript_offset": "not-a-number"})
+    assert resp.status_code == 400
+    assert "transcript_offset" in resp.json()["error"]
+
+
+# ── 8.14 started_at / ended_at accepted as optional turn fields ───────────────
+
+def test_started_at_ended_at_accepted():
+    transcript = json.dumps([{
+        "speaker": "A",
+        "text": "hello",
+        "timestamp": NOW,
+        "started_at": NOW,
+        "ended_at": NOW + 2,
+    }])
+    resp = post_batch([ts_image(NOW)], transcript=transcript)
+    assert resp.status_code == 202
+
+
+def test_started_at_must_be_int_if_present():
+    transcript = json.dumps([{
+        "speaker": "A",
+        "text": "hello",
+        "timestamp": NOW,
+        "started_at": "not-a-number",
+    }])
+    resp = post_batch([ts_image(NOW)], transcript=transcript)
+    assert resp.status_code == 400
+    assert "started_at" in resp.json()["error"]

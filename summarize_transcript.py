@@ -10,6 +10,8 @@ Usage:
     meta = summarize_batch("batch_<uuid>")
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -234,15 +236,26 @@ def summarize_batch(batch_id: str, _client: anthropic.Anthropic = None) -> dict:
     # Timestamp join — images assigned by turn boundaries; last node gets 90 s tail
     nodes = join_images_to_nodes(nodes, image_records)
 
+    # Read meta for transcript_offset (defaults to 0 for legacy batches without the key)
+    meta_path = batch_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    transcript_offset = int(meta.get("transcript_offset", 0))
+
+    # Filter: only persist nodes introduced in the new turns (those at or after the
+    # first new turn's timestamp). Prior turns supply Sonnet context but must not
+    # generate duplicate nodes in the intent graph.
+    if transcript_offset > 0 and turns and transcript_offset < len(turns):
+        cutoff = turns[transcript_offset]["timestamp"]
+        nodes = [n for n in nodes if n.get("occurred_at", 0) >= cutoff]
+
     # Persist
     (batch_dir / "intent_graph.json").write_text(
         json.dumps(nodes, indent=2), encoding="utf-8"
     )
 
-    meta_path = batch_dir / "meta.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta["summarization_status"] = summarization_status
     meta["node_count"] = len(nodes)
+    meta["transcript_offset"] = transcript_offset
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return meta

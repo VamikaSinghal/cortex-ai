@@ -9,6 +9,8 @@ Later pipeline stages read from staging/<batch_id>/.
 Run: uvicorn intake_api:app --reload
 """
 
+from __future__ import annotations
+
 import json
 import re
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ MAX_TRANSCRIPT_TURNS = 200           # oldest turns dropped when client sends fu
 
 TURN_REQUIRED_FIELDS = ("speaker", "text", "timestamp")
 TURN_INT_FIELDS = ("timestamp",)
+TURN_OPTIONAL_INT_FIELDS = ("started_at", "ended_at")
 
 
 def extract_timestamp(filename: str) -> int | None:
@@ -64,6 +67,9 @@ def validate_transcript(raw: str) -> tuple[list, str | None]:
                 return [], f"transcript[{i}] missing required field: {field}"
         for field in TURN_INT_FIELDS:
             if not isinstance(turn[field], int):
+                return [], f"transcript[{i}] field '{field}' must be an integer"
+        for field in TURN_OPTIONAL_INT_FIELDS:
+            if field in turn and not isinstance(turn[field], int):
                 return [], f"transcript[{i}] field '{field}' must be an integer"
 
     return turns, None
@@ -151,6 +157,27 @@ async def intake_batch(request: Request):
             content={"error": "transcript exceeds max size (500 KB)"},
         )
 
+    # ── Optional session metadata ─────────────────────────────────────────────
+    session_id_raw = form.get("session_id", None)
+    session_id: str | None = str(session_id_raw).strip() or None if session_id_raw is not None else None
+
+    transcript_offset_raw = form.get("transcript_offset", None)
+    if transcript_offset_raw is not None:
+        try:
+            transcript_offset = int(transcript_offset_raw)
+            if transcript_offset < 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "transcript_offset must be a non-negative integer"},
+            )
+    else:
+        transcript_offset = 0
+
+    # Clamp so downstream can index safely
+    transcript_offset = max(0, min(transcript_offset, len(turns)))
+
     # ── Stage to filesystem ───────────────────────────────────────────────────
     batch_id = f"batch_{uuid4()}"
     batch_dir = STAGING_DIR / batch_id
@@ -168,6 +195,8 @@ async def intake_batch(request: Request):
         "batch_id": batch_id,
         "image_count": len(image_data),
         "received_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "transcript_offset": transcript_offset,
     }
     (batch_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

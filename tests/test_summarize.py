@@ -217,3 +217,77 @@ def test_join_no_images():
     nodes = [_node(T), _node(T + 5)]
     result = join_images_to_nodes(nodes, [])
     assert all(n["related_images"] == [] for n in result)
+
+
+# ── Tests 6.10–6.12: transcript_offset node filter ───────────────────────────
+
+def make_batch_with_offset(staging_dir: Path, turns: list, transcript_offset: int) -> str:
+    from uuid import uuid4
+    batch_id = f"batch_{uuid4()}"
+    batch_dir = staging_dir / batch_id
+    batch_dir.mkdir()
+    (batch_dir / "transcript.json").write_text(json.dumps(turns), encoding="utf-8")
+    meta = {
+        "batch_id": batch_id,
+        "image_count": 0,
+        "received_at": "2024-01-01T00:00:00+00:00",
+        "transcript_offset": transcript_offset,
+    }
+    (batch_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return batch_id
+
+
+def test_offset_filter_drops_prior_nodes(staging):
+    """transcript_offset=1: node at turns[0].timestamp is dropped; node at turns[1].timestamp kept."""
+    turns = [
+        {"speaker": "A", "text": "old turn", "timestamp": T},
+        {"speaker": "B", "text": "new turn", "timestamp": T + 10},
+    ]
+    old_node = {**GOAL_NODE, "id": "old", "occurred_at": T}
+    new_node = {**INTERRUPTION_NODE, "id": "new", "occurred_at": T + 10}
+
+    batch_id = make_batch_with_offset(staging, turns, transcript_offset=1)
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_sonnet_response([old_node, new_node])
+
+    with patch.object(summarize_transcript, "compress_transcript", return_value="[t]"):
+        meta = summarize_batch(batch_id, _client=mock_client)
+
+    nodes = json.loads((staging / batch_id / "intent_graph.json").read_text())
+    ids = [n["id"] for n in nodes]
+    assert "new" in ids, "new node must be retained"
+    assert "old" not in ids, "old node must be filtered out"
+    assert meta["node_count"] == 1
+    assert meta["transcript_offset"] == 1
+
+
+def test_offset_zero_keeps_all_nodes(staging):
+    """transcript_offset=0: no filter applied; all nodes written."""
+    turns = [
+        {"speaker": "A", "text": "turn 0", "timestamp": T},
+        {"speaker": "B", "text": "turn 1", "timestamp": T + 10},
+    ]
+    batch_id = make_batch_with_offset(staging, turns, transcript_offset=0)
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_sonnet_response([GOAL_NODE, INTERRUPTION_NODE])
+
+    with patch.object(summarize_transcript, "compress_transcript", return_value="[t]"):
+        meta = summarize_batch(batch_id, _client=mock_client)
+
+    nodes = json.loads((staging / batch_id / "intent_graph.json").read_text())
+    assert len(nodes) == 2
+    assert meta["node_count"] == 2
+
+
+def test_offset_absent_in_legacy_meta_keeps_all_nodes(staging):
+    """meta.json without transcript_offset key: defaults to 0, all nodes written."""
+    batch_id = make_batch(staging, SAMPLE_TURNS)  # make_batch writes no transcript_offset
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_sonnet_response([GOAL_NODE, INTERRUPTION_NODE])
+
+    with patch.object(summarize_transcript, "compress_transcript", return_value="[t]"):
+        meta = summarize_batch(batch_id, _client=mock_client)
+
+    nodes = json.loads((staging / batch_id / "intent_graph.json").read_text())
+    assert len(nodes) == 2
+    assert meta["transcript_offset"] == 0
