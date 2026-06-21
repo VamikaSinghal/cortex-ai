@@ -4,3 +4,13 @@ redis[hiredis]>=5.0.0
 openai>=1.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+voyageai>=0.2.0
+
+# Intake API
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Tests
+pytest>=8.0.0
+httpx>=0.27.0
