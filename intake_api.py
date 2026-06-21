@@ -1,10 +1,10 @@
 """
 cortex/intake_api.py
 --------------------
-POST /api/intake/batch — stage a batch of images + transcript for async processing.
+POST /api/intake/batch — receive images + transcript, extract context with Claude Haiku.
 
-Returns 202 + batch_id immediately. No LLM calls, no intent-graph writes.
-Later pipeline stages read from staging/<batch_id>/.
+Returns 200 with extracted context immediately (synchronous).
+Images are staged to disk; transcript is summarized inline.
 
 Run: uvicorn intake_api:app --reload
 """
@@ -17,7 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import anthropic
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+
+load_dotenv()
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
@@ -25,32 +29,50 @@ app = FastAPI()
 STAGING_DIR = Path("staging")
 MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 5 MB
-MAX_TRANSCRIPT_BYTES = 500 * 1024    # 500 KB soft limit — exceeded turns are trimmed
-HARD_MAX_TRANSCRIPT_BYTES = MAX_TRANSCRIPT_BYTES * 20  # 10 MB ceiling before parse
-MAX_TRANSCRIPT_TURNS = 200           # oldest turns dropped when client sends full session history
+MAX_TRANSCRIPT_TURNS = 200
 
 TURN_REQUIRED_FIELDS = ("speaker", "text", "timestamp")
 TURN_INT_FIELDS = ("timestamp",)
 TURN_OPTIONAL_INT_FIELDS = ("started_at", "ended_at")
 
+EXTRACTION_SYSTEM_PROMPT = """You are a context extraction engine for a personal AI assistant called Cortex.
+
+Given a conversation transcript with labeled speakers, extract structured context.
+
+Each item in KEY_INSIGHTS, DECISIONS, OPEN_QUESTIONS, and ACTION_ITEMS must be an object with:
+  {"speaker": "<speaker_id>", "text": "<the insight/decision/question/action>"}
+
+Use the exact speaker ID from the transcript (e.g. "0", "1").
+If an item involves multiple speakers or is general, use the speaker who most drove it.
+
+PEOPLE: people mentioned — {"name": "...", "context": "..."}
+PROJECTS: projects or work items discussed — {"name": "...", "context": "..."}
+SUMMARY: 2-3 sentence summary of the overall conversation (plain string)
+
+Rules:
+- Be concise — capture signal, not noise
+- Only include items with real informational value
+- Empty lists are fine if a category has nothing
+- Return ONLY valid JSON, no markdown fences, no commentary
+
+Example output:
+{
+  "KEY_INSIGHTS": [{"speaker": "0", "text": "Redis vector search is fast enough for real-time retrieval"}],
+  "DECISIONS": [{"speaker": "1", "text": "Use GitHub instead of Obsidian for note storage"}],
+  "OPEN_QUESTIONS": [{"speaker": "0", "text": "Does the Omi webhook support streaming?"}],
+  "PEOPLE": [{"name": "Sarah", "context": "Teammate handling the MCP server"}],
+  "PROJECTS": [{"name": "Cortex", "context": "Universal context layer for AI"}],
+  "ACTION_ITEMS": [{"speaker": "0", "text": "Set up Redis Stack with Docker before hacking starts"}],
+  "SUMMARY": "Discussed Cortex architecture. Decided on GitHub for storage and Redis for vector search."
+}"""
+
 
 def extract_timestamp(filename: str) -> int | None:
-    """Return first 8+-digit integer found in filename, or None."""
     match = re.search(r"\d{8,}", filename)
     return int(match.group()) if match else None
 
 
-def _trim_oldest_turns(turns: list, max_bytes: int) -> list:
-    """Drop the oldest turns until the JSON encoding fits within max_bytes."""
-    while turns and len(json.dumps(turns).encode("utf-8")) > max_bytes:
-        turns = turns[1:]
-    return turns
-
-
-# ── Transcript validation ─────────────────────────────────────────────────────
-
 def validate_transcript(raw: str) -> tuple[list, str | None]:
-    """Parse and validate transcript JSON. Returns (turns, error_msg)."""
     try:
         turns = json.loads(raw)
     except json.JSONDecodeError:
@@ -75,129 +97,126 @@ def validate_transcript(raw: str) -> tuple[list, str | None]:
     return turns, None
 
 
-# ── Route ─────────────────────────────────────────────────────────────────────
+def format_transcript(turns: list) -> str:
+    lines = []
+    for turn in turns:
+        lines.append(f"[Speaker {turn['speaker']}]: {turn['text']}")
+    return "\n".join(lines)
+
+
+def _parse_json(text: str) -> dict | None:
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            result = json.loads(match.group())
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return None
+
 
 @app.post("/api/intake/batch")
 async def intake_batch(request: Request):
     content_type = request.headers.get("content-type", "")
-    if not content_type or (
-        "multipart/form-data" not in content_type
-        and "application/x-www-form-urlencoded" not in content_type
-    ):
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Content-Type must be multipart/form-data"},
-        )
+    if "multipart/form-data" not in content_type and "application/x-www-form-urlencoded" not in content_type:
+        return JSONResponse(status_code=400, content={"error": "Content-Type must be multipart/form-data"})
 
     try:
         form = await request.form()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "malformed multipart request"})
 
-    # ── Collect images ────────────────────────────────────────────────────────
+    # ── Images ────────────────────────────────────────────────────────────────
     images = form.getlist("images[]")
     if not images:
         return JSONResponse(status_code=400, content={"error": "images[] must contain at least one image"})
-
     if len(images) > MAX_IMAGES:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"batch exceeds max image count ({MAX_IMAGES})"},
-        )
+        return JSONResponse(status_code=400, content={"error": f"batch exceeds max image count ({MAX_IMAGES})"})
 
-    # ── Read image bytes, extract per-image timestamp from filename ───────────
-    image_data: list[tuple[str, int, int, bytes]] = []  # (filename, observed_at, idx, data)
-
+    image_data: list[tuple[str, int, int, bytes]] = []
     for idx, upload in enumerate(images):
-        # Strip directory components to prevent path traversal
         filename = Path(upload.filename or f"image_{idx}").name or f"image_{idx}"
         ts = extract_timestamp(filename)
         if ts is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"image '{filename}' has no timestamp in filename (need 8+ digit sequence)"},
-            )
+            return JSONResponse(status_code=400, content={"error": f"image '{filename}' has no timestamp in filename (need 8+ digit sequence)"})
         data = await upload.read()
         if len(data) > MAX_IMAGE_BYTES:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"image '{filename}' exceeds max size (5 MB)"},
-            )
+            return JSONResponse(status_code=400, content={"error": f"image '{filename}' exceeds max size (5 MB)"})
         image_data.append((filename, ts, idx, data))
 
     # ── Transcript ────────────────────────────────────────────────────────────
     transcript_raw = form.get("transcript", "")
     if not isinstance(transcript_raw, str):
-        # UploadFile instead of a plain string — shouldn't happen but guard it
         transcript_raw = (await transcript_raw.read()).decode("utf-8")
-
-    # Hard ceiling: guard against OOM before attempting to parse
-    if len(transcript_raw.encode("utf-8")) > HARD_MAX_TRANSCRIPT_BYTES:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "transcript exceeds max size (500 KB)"},
-        )
 
     turns, err = validate_transcript(transcript_raw)
     if err:
         return JSONResponse(status_code=400, content={"error": err})
 
-    # Android clients accumulate all turns across a session and replay them on every upload.
-    # Trim the oldest turns first so the byte check below only fires on genuinely malformed input
-    # (e.g. a single turn whose text field alone exceeds the limit).
     if len(turns) > MAX_TRANSCRIPT_TURNS:
         turns = turns[-MAX_TRANSCRIPT_TURNS:]
 
-    # After semantic trim, reject if the transcript is still over the byte limit.
-    # This catches turns with pathologically large individual text fields.
-    transcript_raw = json.dumps(turns)
-    if len(transcript_raw.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "transcript exceeds max size (500 KB)"},
-        )
-
-    # ── Optional session metadata ─────────────────────────────────────────────
-    session_id_raw = form.get("session_id", None)
-    session_id: str | None = str(session_id_raw).strip() or None if session_id_raw is not None else None
-
-    transcript_offset_raw = form.get("transcript_offset", None)
-    if transcript_offset_raw is not None:
-        try:
-            transcript_offset = int(transcript_offset_raw)
-            if transcript_offset < 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            return JSONResponse(
-                status_code=400,
-                content={"error": "transcript_offset must be a non-negative integer"},
-            )
-    else:
-        transcript_offset = 0
-
-    # Clamp so downstream can index safely
-    transcript_offset = max(0, min(transcript_offset, len(turns)))
-
-    # ── Stage to filesystem ───────────────────────────────────────────────────
+    # ── Stage images ──────────────────────────────────────────────────────────
     batch_id = f"batch_{uuid4()}"
     batch_dir = STAGING_DIR / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     for filename, ts, idx, data in image_data:
-        # Include the batch index so two frames with the same second-level timestamp
-        # get distinct filenames instead of silently overwriting each other.
         dest = batch_dir / f"{ts}_{idx:03d}_{filename}"
         dest.write_bytes(data)
 
-    (batch_dir / "transcript.json").write_text(transcript_raw, encoding="utf-8")
+    (batch_dir / "transcript.json").write_text(json.dumps(turns, indent=2), encoding="utf-8")
 
-    meta = {
-        "batch_id": batch_id,
-        "image_count": len(image_data),
-        "received_at": datetime.now(timezone.utc).isoformat(),
-        "session_id": session_id,
-        "transcript_offset": transcript_offset,
+    # ── Extract context with Haiku ────────────────────────────────────────────
+    extraction: dict = {
+        "KEY_INSIGHTS": [],
+        "DECISIONS": [],
+        "OPEN_QUESTIONS": [],
+        "PEOPLE": [],
+        "PROJECTS": [],
+        "ACTION_ITEMS": [],
+        "SUMMARY": "",
     }
-    (batch_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    return JSONResponse(status_code=202, content={"batch_id": batch_id})
+    if turns:
+        formatted = format_transcript(turns)
+        speakers = sorted({str(t["speaker"]) for t in turns})
+
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=2000,
+            system=EXTRACTION_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Speakers in this conversation: {', '.join(speakers)}\n\n"
+                    f"{formatted}\n\n"
+                    "Extract context as JSON:"
+                ),
+            }],
+        )
+
+        raw_output = response.content[0].text if response.content else ""
+        parsed = _parse_json(raw_output)
+        if parsed:
+            extraction.update(parsed)
+
+    extraction["_source"] = "glasses"
+    extraction["_timestamp"] = datetime.now(timezone.utc).isoformat()
+    extraction["_batch_id"] = batch_id
+    extraction["_image_count"] = len(image_data)
+    extraction["_speakers"] = sorted({str(t["speaker"]) for t in turns})
+
+    (batch_dir / "extraction.json").write_text(json.dumps(extraction, indent=2), encoding="utf-8")
+
+    return JSONResponse(status_code=200, content=extraction)
