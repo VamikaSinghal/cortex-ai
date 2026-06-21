@@ -23,7 +23,9 @@ app = FastAPI()
 STAGING_DIR = Path("staging")
 MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 5 MB
-MAX_TRANSCRIPT_BYTES = 500 * 1024    # 500 KB
+MAX_TRANSCRIPT_BYTES = 500 * 1024    # 500 KB soft limit — exceeded turns are trimmed
+HARD_MAX_TRANSCRIPT_BYTES = MAX_TRANSCRIPT_BYTES * 20  # 10 MB ceiling before parse
+MAX_TRANSCRIPT_TURNS = 200           # oldest turns dropped when client sends full session history
 
 TURN_REQUIRED_FIELDS = ("speaker", "text", "timestamp")
 TURN_INT_FIELDS = ("timestamp",)
@@ -33,6 +35,13 @@ def extract_timestamp(filename: str) -> int | None:
     """Return first 8+-digit integer found in filename, or None."""
     match = re.search(r"\d{8,}", filename)
     return int(match.group()) if match else None
+
+
+def _trim_oldest_turns(turns: list, max_bytes: int) -> list:
+    """Drop the oldest turns until the JSON encoding fits within max_bytes."""
+    while turns and len(json.dumps(turns).encode("utf-8")) > max_bytes:
+        turns = turns[1:]
+    return turns
 
 
 # ── Transcript validation ─────────────────────────────────────────────────────
@@ -91,10 +100,11 @@ async def intake_batch(request: Request):
         )
 
     # ── Read image bytes, extract per-image timestamp from filename ───────────
-    image_data: list[tuple[str, int, bytes]] = []  # (filename, observed_at, data)
+    image_data: list[tuple[str, int, int, bytes]] = []  # (filename, observed_at, idx, data)
 
     for idx, upload in enumerate(images):
-        filename = upload.filename or f"image_{idx}"
+        # Strip directory components to prevent path traversal
+        filename = Path(upload.filename or f"image_{idx}").name or f"image_{idx}"
         ts = extract_timestamp(filename)
         if ts is None:
             return JSONResponse(
@@ -107,7 +117,7 @@ async def intake_batch(request: Request):
                 status_code=400,
                 content={"error": f"image '{filename}' exceeds max size (5 MB)"},
             )
-        image_data.append((filename, ts, data))
+        image_data.append((filename, ts, idx, data))
 
     # ── Transcript ────────────────────────────────────────────────────────────
     transcript_raw = form.get("transcript", "")
@@ -115,7 +125,8 @@ async def intake_batch(request: Request):
         # UploadFile instead of a plain string — shouldn't happen but guard it
         transcript_raw = (await transcript_raw.read()).decode("utf-8")
 
-    if len(transcript_raw.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+    # Hard ceiling: guard against OOM before attempting to parse
+    if len(transcript_raw.encode("utf-8")) > HARD_MAX_TRANSCRIPT_BYTES:
         return JSONResponse(
             status_code=400,
             content={"error": "transcript exceeds max size (500 KB)"},
@@ -125,13 +136,30 @@ async def intake_batch(request: Request):
     if err:
         return JSONResponse(status_code=400, content={"error": err})
 
+    # Android clients accumulate all turns across a session and replay them on every upload.
+    # Trim the oldest turns first so the byte check below only fires on genuinely malformed input
+    # (e.g. a single turn whose text field alone exceeds the limit).
+    if len(turns) > MAX_TRANSCRIPT_TURNS:
+        turns = turns[-MAX_TRANSCRIPT_TURNS:]
+
+    # After semantic trim, reject if the transcript is still over the byte limit.
+    # This catches turns with pathologically large individual text fields.
+    transcript_raw = json.dumps(turns)
+    if len(transcript_raw.encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "transcript exceeds max size (500 KB)"},
+        )
+
     # ── Stage to filesystem ───────────────────────────────────────────────────
     batch_id = f"batch_{uuid4()}"
     batch_dir = STAGING_DIR / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename, ts, data in image_data:
-        dest = batch_dir / f"{ts}_{filename}"
+    for filename, ts, idx, data in image_data:
+        # Include the batch index so two frames with the same second-level timestamp
+        # get distinct filenames instead of silently overwriting each other.
+        dest = batch_dir / f"{ts}_{idx:03d}_{filename}"
         dest.write_bytes(data)
 
     (batch_dir / "transcript.json").write_text(transcript_raw, encoding="utf-8")

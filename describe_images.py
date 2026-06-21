@@ -13,6 +13,7 @@ Run smoke test:
 
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ import anthropic
 
 STAGING_DIR = Path("staging")
 MODEL = "claude-haiku-4-5"
+_DESCRIBE_WORKERS = 5  # concurrent Haiku calls per batch
 REDACTION_SYSTEM_PROMPT = (
     "Do not include: names or identifying features of people; "
     "on-screen text, document content, or displayed UI; "
@@ -66,7 +68,6 @@ def describe_image(
         response = _client.messages.create(
             model=MODEL,
             max_tokens=1024,
-            thinking={"type": "disabled"},
             system=REDACTION_SYSTEM_PROMPT,
             messages=[
                 {
@@ -114,18 +115,22 @@ def process_batch(batch_id: str) -> dict:
     image_files.sort(key=get_observed_at)
 
     client = anthropic.Anthropic()
-    records = []
-    for i, img_path in enumerate(image_files):
-        observed_at = get_observed_at(img_path)
-        record = describe_image(
+
+    def _describe_one(img_path: Path) -> dict:
+        return describe_image(
             img_path.read_bytes(),
-            observed_at,
+            get_observed_at(img_path),
             image_id=img_path.name,
             _client=client,
         )
-        if i == 0:
-            record["is_first_in_batch"] = True
-        records.append(record)
+
+    workers = min(_DESCRIBE_WORKERS, len(image_files)) if image_files else 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # executor.map preserves input order
+        records = list(executor.map(_describe_one, image_files))
+
+    if records:
+        records[0]["is_first_in_batch"] = True
 
     (batch_dir / "descriptions.json").write_text(
         json.dumps(records, indent=2), encoding="utf-8"
