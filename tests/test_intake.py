@@ -39,12 +39,13 @@ PNG = minimal_png()
 NOW = int(time.time())
 
 VALID_TRANSCRIPT = json.dumps([
-    {"speaker": "A", "text": "hello", "started_at": NOW, "ended_at": NOW + 2},
-    {"speaker": "B", "text": "world", "started_at": NOW + 3, "ended_at": NOW + 5},
+    {"speaker": "A", "text": "hello", "timestamp": NOW},
+    {"speaker": "B", "text": "world", "timestamp": NOW + 3},
 ])
 
 
 def ts_image(ts: int, suffix: str = ".png") -> tuple[str, bytes, str]:
+    """Image with an 8+-digit timestamp embedded in the filename."""
     return (f"{ts}{suffix}", PNG, "image/png")
 
 
@@ -75,20 +76,19 @@ def test_valid_batch_returns_202():
     assert body["batch_id"].startswith("batch_")
 
 
-# ── 8.2 Missing image timestamp (no integers at all) ─────────────────────────
+# ── 8.2 Image with no timestamp in filename ───────────────────────────────────
 
 def test_missing_timestamp_returns_400_naming_image():
     images = [ts_image(NOW), ("photo.png", PNG, "image/png")]
     resp = post_batch(images)
     assert resp.status_code == 400
-    body = resp.json()
-    assert "photo.png" in body["error"]
+    assert "photo.png" in resp.json()["error"]
 
 
-# ── 8.3 Unparseable timestamp (no 8-digit run in filename) ───────────────────
+# ── 8.3 Timestamp too short (fewer than 8 digits) ────────────────────────────
 
-def test_unparseable_timestamp_returns_400():
-    images = [("img_123.png", PNG, "image/png")]  # 123 is too short
+def test_short_timestamp_returns_400():
+    images = [("img_123.png", PNG, "image/png")]  # 123 is only 3 digits
     resp = post_batch(images)
     assert resp.status_code == 400
     assert "img_123.png" in resp.json()["error"]
@@ -98,13 +98,13 @@ def test_unparseable_timestamp_returns_400():
 
 def test_missing_transcript_field_returns_400():
     transcript = json.dumps([
-        {"speaker": "A", "text": "hi", "ended_at": NOW + 2}
-        # started_at missing
+        {"speaker": "A", "text": "hi"}
+        # timestamp missing
     ])
     resp = post_batch([ts_image(NOW)], transcript=transcript)
     assert resp.status_code == 400
     body = resp.json()
-    assert "started_at" in body["error"]
+    assert "timestamp" in body["error"]
     assert "transcript[0]" in body["error"]
 
 
@@ -153,7 +153,7 @@ def test_oversized_image_returns_400():
 
 def test_oversized_transcript_returns_400():
     big_transcript = json.dumps([
-        {"speaker": "A", "text": "x" * (500 * 1024), "started_at": NOW, "ended_at": NOW + 1}
+        {"speaker": "A", "text": "x" * (500 * 1024), "timestamp": NOW}
     ])
     resp = post_batch([ts_image(NOW)], transcript=big_transcript)
     assert resp.status_code == 400

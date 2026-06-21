@@ -25,31 +25,14 @@ MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 5 MB
 MAX_TRANSCRIPT_BYTES = 500 * 1024    # 500 KB
 
-TURN_REQUIRED_FIELDS = ("speaker", "text", "started_at", "ended_at")
-TURN_INT_FIELDS = ("started_at", "ended_at")
+TURN_REQUIRED_FIELDS = ("speaker", "text", "timestamp")
+TURN_INT_FIELDS = ("timestamp",)
 
 
-# ── Timestamp extraction ──────────────────────────────────────────────────────
-
-def extract_timestamp(filename: str, index: int, timestamps_companion: list[str]) -> int | None:
-    """
-    Extract a UNIX timestamp for an image.
-    Primary: longest run of digits (≥8 chars) in the filename.
-    Fallback: parallel timestamps[] form field at the same index.
-    """
-    integers = re.findall(r"\d+", filename)
-    if integers:
-        longest = max(integers, key=len)
-        if len(longest) >= 8:
-            return int(longest)
-
-    if index < len(timestamps_companion):
-        try:
-            return int(timestamps_companion[index])
-        except (ValueError, TypeError):
-            pass
-
-    return None
+def extract_timestamp(filename: str) -> int | None:
+    """Return first 8+-digit integer found in filename, or None."""
+    match = re.search(r"\d{8,}", filename)
+    return int(match.group()) if match else None
 
 
 # ── Transcript validation ─────────────────────────────────────────────────────
@@ -107,29 +90,23 @@ async def intake_batch(request: Request):
             content={"error": f"batch exceeds max image count ({MAX_IMAGES})"},
         )
 
-    # ── Collect optional parallel timestamps ──────────────────────────────────
-    timestamps_companion = form.getlist("timestamps[]")
-
-    # ── Read image bytes + validate size + extract timestamps ─────────────────
-    image_data: list[tuple[str, int, bytes]] = []  # (filename, timestamp, data)
+    # ── Read image bytes, extract per-image timestamp from filename ───────────
+    image_data: list[tuple[str, int, bytes]] = []  # (filename, observed_at, data)
 
     for idx, upload in enumerate(images):
         filename = upload.filename or f"image_{idx}"
+        ts = extract_timestamp(filename)
+        if ts is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"image '{filename}' has no timestamp in filename (need 8+ digit sequence)"},
+            )
         data = await upload.read()
-
         if len(data) > MAX_IMAGE_BYTES:
             return JSONResponse(
                 status_code=400,
                 content={"error": f"image '{filename}' exceeds max size (5 MB)"},
             )
-
-        ts = extract_timestamp(filename, idx, timestamps_companion)
-        if ts is None:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"image '{filename}' missing timestamp"},
-            )
-
         image_data.append((filename, ts, data))
 
     # ── Transcript ────────────────────────────────────────────────────────────

@@ -48,8 +48,8 @@ def main():
     ]
 
     transcript = [
-        {"speaker": "A", "text": "Hey, how's it going?", "started_at": ts1, "ended_at": ts1 + 3},
-        {"speaker": "B", "text": "Pretty good, working on Cortex.", "started_at": ts2, "ended_at": ts2 + 4},
+        {"speaker": "A", "text": "Hey, how's it going?", "timestamp": ts1},
+        {"speaker": "B", "text": "Pretty good, working on Cortex.", "timestamp": ts2},
     ]
 
     files = [("images[]", (name, data, "image/png")) for name, data in images]
