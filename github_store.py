@@ -1,12 +1,26 @@
 """
 cortex/github_store.py
 ----------------------
-Push extracted context notes to a GitHub repo via the GitHub REST API.
-Each insight/decision/question becomes a .md file.
-Each commit message encodes source + timestamp for full provenance.
+Push extracted context to GitHub repo via the REST API.
+
+Repo structure (v2):
+  sources/src_*.md            — immutable source manifests
+  records/YYYY-MM-DD/mem_*.md — dated atomic claims and decisions
+  entities/people/person_*.md — canonical person pages (append-only)
+  entities/projects/proj_*.md — canonical project pages
+  tasks/open/task_*.md        — open actions and questions
+  tasks/resolved/task_*.md    — completed tasks
+  knowledge/decisions/        — high-importance curated decisions
+  views/                      — generated summaries (person dossiers, project briefs)
+  indexes/entity-registry.json — canonical entity ID → name mapping
+
+Every file has YAML front matter with stable IDs, kind, status,
+confidence, importance, source_ids, entity_ids, topics.
 """
 
 import base64
+import hashlib
+import json
 import os
 import re
 import requests
@@ -14,10 +28,12 @@ from datetime import datetime
 from typing import Optional
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-CORTEX_REPO = os.environ.get("CORTEX_REPO", "")  # e.g. "vamikasinghal/cortex-brain"
+CORTEX_REPO = os.environ.get("CORTEX_REPO", "")
 GITHUB_API = "https://api.github.com"
 BRANCH = os.environ.get("CORTEX_BRANCH", "main")
 
+
+# ── GitHub helpers ─────────────────────────────────────────────────────────────
 
 def _headers() -> dict:
     return {
@@ -27,15 +43,7 @@ def _headers() -> dict:
     }
 
 
-def _safe_filename(text: str, max_len: int = 50) -> str:
-    """Turn arbitrary text into a safe filename slug."""
-    slug = re.sub(r"[^\w\s-]", "", text.lower())
-    slug = re.sub(r"[\s_]+", "-", slug).strip("-")
-    return slug[:max_len]
-
-
 def _get_existing_sha(filepath: str) -> Optional[str]:
-    """Get the SHA of a file if it already exists (needed for updates)."""
     url = f"{GITHUB_API}/repos/{CORTEX_REPO}/contents/{filepath}"
     resp = requests.get(url, headers=_headers(), params={"ref": BRANCH})
     if resp.status_code == 200:
@@ -43,20 +51,18 @@ def _get_existing_sha(filepath: str) -> Optional[str]:
     return None
 
 
+def _get_existing_content(filepath: str) -> Optional[str]:
+    url = f"{GITHUB_API}/repos/{CORTEX_REPO}/contents/{filepath}"
+    resp = requests.get(url, headers=_headers(), params={"ref": BRANCH})
+    if resp.status_code == 200:
+        data = resp.json()
+        return base64.b64decode(data["content"]).decode("utf-8")
+    return None
+
+
 def push_file(filepath: str, content: str, commit_message: str) -> bool:
-    """
-    Create or update a file in the GitHub repo.
-
-    Args:
-        filepath: Path within the repo, e.g. "notes/insights/2026-06-20-insight.md"
-        content: Markdown content to write
-        commit_message: Git commit message
-
-    Returns:
-        True if successful
-    """
     if not GITHUB_TOKEN or not CORTEX_REPO:
-        raise EnvironmentError("GITHUB_TOKEN and CORTEX_REPO must be set in environment")
+        raise EnvironmentError("GITHUB_TOKEN and CORTEX_REPO must be set")
 
     url = f"{GITHUB_API}/repos/{CORTEX_REPO}/contents/{filepath}"
     sha = _get_existing_sha(filepath)
@@ -67,177 +73,280 @@ def push_file(filepath: str, content: str, commit_message: str) -> bool:
         "branch": BRANCH,
     }
     if sha:
-        payload["sha"] = sha  # Required for updates
+        payload["sha"] = sha
 
     resp = requests.put(url, headers=_headers(), json=payload)
     return resp.status_code in (200, 201)
 
 
-def _build_note_frontmatter(note_type: str, source: str, timestamp: str, extra: dict = None) -> str:
-    lines = [
-        "---",
-        f"type: {note_type}",
-        f"source: {source}",
-        f"timestamp: {timestamp}",
-    ]
-    if extra:
-        for k, v in extra.items():
-            lines.append(f"{k}: {v}")
+def _slug(text: str, max_len: int = 50) -> str:
+    s = re.sub(r"[^\w\s-]", "", text.lower())
+    s = re.sub(r"[\s_]+", "-", s).strip("-")
+    return s[:max_len]
+
+
+# ── Front matter builder ───────────────────────────────────────────────────────
+
+def _frontmatter(fields: dict) -> str:
+    """Build YAML front matter from a dict."""
+    lines = ["---"]
+    for k, v in fields.items():
+        if isinstance(v, list):
+            if v:
+                lines.append(f"{k}:")
+                for item in v:
+                    lines.append(f"  - {item}")
+            else:
+                lines.append(f"{k}: []")
+        elif v is None:
+            lines.append(f"{k}: null")
+        else:
+            # Quote strings that contain special chars
+            sv = str(v)
+            if any(c in sv for c in [":", "#", "[", "]", "{", "}"]):
+                lines.append(f'{k}: "{sv}"')
+            else:
+                lines.append(f"{k}: {sv}")
     lines.append("---")
     return "\n".join(lines)
 
 
+# ── Main save function ─────────────────────────────────────────────────────────
+
 def save_extracted_context(extracted: dict, raw_text: str = "") -> list[str]:
     """
-    Save all extracted context items to the GitHub repo.
+    Save all extracted context items to the GitHub repo (new v2 structure).
 
-    Args:
-        extracted: Output from ingest.extract_context()
-        raw_text: Original raw text (stored as reference excerpt)
-
-    Returns:
-        List of file paths that were successfully saved
+    Returns list of file paths successfully saved.
     """
     source = extracted.get("_source", "unknown")
+    source_id = extracted.get("_source_id", "src_unknown")
     timestamp = extracted.get("_timestamp", datetime.now().isoformat())
-    date_str = timestamp[:10]  # YYYY-MM-DD
-    commit_prefix = f"ingest({source}): {timestamp}"
+    date_str = timestamp[:10]
+    captured_at = timestamp
 
     saved = []
 
-    # ── 1. Key Insights ──────────────────────────────────────────────────────
-    for i, insight in enumerate(extracted.get("KEY_INSIGHTS", [])):
-        slug = _safe_filename(insight)
-        filepath = f"notes/insights/{date_str}-{slug}.md"
-        frontmatter = _build_note_frontmatter("insight", source, timestamp)
-        content = f"""{frontmatter}
+    # ── 1. Source manifest ─────────────────────────────────────────────────────
+    source_path = f"sources/{source_id}.md"
+    source_fm = _frontmatter({
+        "id": source_id,
+        "kind": "source",
+        "source": source,
+        "captured_at": captured_at,
+        "raw_length": extracted.get("_raw_length", 0),
+        "scope": "private",
+    })
+    source_content = f"""{source_fm}
 
-# {insight}
+# Source: {source} · {date_str}
 
-## Source
-`{source}` · {timestamp}
+**Captured:** {captured_at}
+**From:** `{source}`
+
+## Summary
+
+{extracted.get('summary', '_No summary extracted._')}
 
 ## Raw Excerpt
-> {raw_text[:300].strip()}{"..." if len(raw_text) > 300 else ""}
+
+> {raw_text[:400].strip()}{"..." if len(raw_text) > 400 else ""}
 """
-        if push_file(filepath, content, f"{commit_prefix} | insight {i+1}"):
+    if push_file(source_path, source_content, f"source({source}): {source_id} @ {date_str}"):
+        saved.append(source_path)
+
+    # ── 2. Records (claims, decisions, observations) ───────────────────────────
+    for record in extracted.get("records", []):
+        rid = record.get("id", "mem_unknown")
+        kind = record.get("kind", "claim")
+        content = record.get("content", "")
+        confidence = record.get("confidence", "confirmed")
+        importance = record.get("importance", 3)
+        entity_ids = record.get("entity_ids", [])
+        topics = record.get("topics", [])
+        occurred_at = record.get("occurred_at")
+
+        if not content.strip():
+            continue
+
+        filepath = f"records/{date_str}/{rid}.md"
+        fm = _frontmatter({
+            "id": rid,
+            "kind": kind,
+            "status": "active",
+            "occurred_at": occurred_at or captured_at,
+            "captured_at": captured_at,
+            "source_ids": [source_id],
+            "entity_ids": entity_ids,
+            "topics": topics,
+            "confidence": confidence,
+            "importance": importance,
+            "scope": "private",
+        })
+
+        header = "Decision" if kind == "decision" else kind.title()
+        doc = f"""{fm}
+
+# {header}: {content[:80]}{"..." if len(content) > 80 else ""}
+
+{content}
+
+**Source:** `{source}` · {date_str}
+**Confidence:** {confidence} · **Importance:** {importance}/5
+"""
+        if push_file(filepath, doc, f"record({kind}): {rid}"):
             saved.append(filepath)
 
-    # ── 2. Decisions ─────────────────────────────────────────────────────────
-    for i, decision in enumerate(extracted.get("DECISIONS", [])):
-        slug = _safe_filename(decision)
-        filepath = f"notes/decisions/{date_str}-{slug}.md"
-        frontmatter = _build_note_frontmatter("decision", source, timestamp)
-        content = f"""{frontmatter}
+        # Also copy high-importance decisions to knowledge/decisions/
+        if kind == "decision" and importance >= 4:
+            knowledge_path = f"knowledge/decisions/{rid}.md"
+            if push_file(knowledge_path, doc, f"knowledge(decision): {rid}"):
+                saved.append(knowledge_path)
 
-# Decision: {decision}
+    # ── 3. Tasks (actions + questions) ────────────────────────────────────────
+    for task in extracted.get("tasks", []):
+        tid = task.get("id", "task_unknown")
+        kind = task.get("kind", "action")
+        content = task.get("content", "")
+        importance = task.get("importance", 3)
+        entity_ids = task.get("entity_ids", [])
+        topics = task.get("topics", [])
+        status = task.get("status", "open")
 
-## Source
-`{source}` · {timestamp}
+        if not content.strip():
+            continue
+
+        filepath = f"tasks/{status}/{tid}.md"
+        fm = _frontmatter({
+            "id": tid,
+            "kind": kind,
+            "status": status,
+            "captured_at": captured_at,
+            "source_ids": [source_id],
+            "entity_ids": entity_ids,
+            "topics": topics,
+            "importance": importance,
+            "scope": "private",
+        })
+
+        icon = "❓" if kind == "question" else "☐"
+        doc = f"""{fm}
+
+# {icon} {content}
+
+**Kind:** {kind} · **Status:** {status} · **Importance:** {importance}/5
+**Source:** `{source}` · {date_str}
 """
-        if push_file(filepath, content, f"{commit_prefix} | decision {i+1}"):
+        if push_file(filepath, doc, f"task({kind}): {tid}"):
             saved.append(filepath)
 
-    # ── 3. Open Questions ─────────────────────────────────────────────────────
-    for i, question in enumerate(extracted.get("OPEN_QUESTIONS", [])):
-        slug = _safe_filename(question)
-        filepath = f"notes/questions/{date_str}-{slug}.md"
-        frontmatter = _build_note_frontmatter("open-question", source, timestamp)
-        content = f"""{frontmatter}
-
-# ❓ {question}
-
-**Status:** open
-
-## Source
-`{source}` · {timestamp}
-"""
-        if push_file(filepath, content, f"{commit_prefix} | question {i+1}"):
-            saved.append(filepath)
-        # Optionally also file as a GitHub Issue (see open_github_issue below)
-
-    # ── 4. People ─────────────────────────────────────────────────────────────
-    for person in extracted.get("PEOPLE", []):
-        name = person.get("name", "unknown") if isinstance(person, dict) else str(person)
-        ctx = person.get("context", "") if isinstance(person, dict) else ""
-        slug = _safe_filename(name)
-        filepath = f"notes/people/{slug}.md"
-
-        # For people, we append to existing note rather than overwrite
-        existing_sha = _get_existing_sha(filepath)
-        if existing_sha:
-            # Append new context entry
-            get_resp = requests.get(
-                f"{GITHUB_API}/repos/{CORTEX_REPO}/contents/{filepath}",
-                headers=_headers()
+        # File questions as GitHub Issues too
+        if kind == "question":
+            open_github_issue(
+                title=f"❓ {content[:100]}",
+                body=f"**Source:** {source}\n**Captured:** {captured_at}\n\n> Auto-filed by Cortex",
+                labels=["open-question", "cortex"]
             )
-            if get_resp.status_code == 200:
-                existing_content = base64.b64decode(get_resp.json()["content"]).decode("utf-8")
-                new_entry = f"\n## {timestamp} · {source}\n{ctx}\n"
-                content = existing_content + new_entry
-            else:
-                content = _person_note(name, ctx, source, timestamp)
+
+    # ── 4. Entities (people, projects, orgs) ──────────────────────────────────
+    for entity in extracted.get("entities", []):
+        eid = entity.get("id", "")
+        ekind = entity.get("kind", "person")
+        name = entity.get("name", "")
+        context_str = entity.get("context", "")
+        aliases = entity.get("aliases", [])
+
+        if not eid or not name:
+            continue
+
+        folder = f"entities/{ekind}s"  # people, projects, orgs
+        filepath = f"{folder}/{eid}.md"
+
+        # Append to existing entity page, or create new
+        existing = _get_existing_content(filepath)
+        if existing:
+            new_entry = f"\n## {date_str} · {source}\n{context_str}\n"
+            doc = existing + new_entry
+            commit_msg = f"entity({ekind}): update {eid}"
         else:
-            content = _person_note(name, ctx, source, timestamp)
+            fm = _frontmatter({
+                "id": eid,
+                "kind": ekind,
+                "name": name,
+                "aliases": aliases,
+                "status": "active",
+                "first_seen": captured_at,
+                "scope": "private",
+            })
+            doc = f"""{fm}
 
-        if push_file(filepath, content, f"{commit_prefix} | person: {name}"):
-            saved.append(filepath)
+# {name}
 
-    # ── 5. Action Items ──────────────────────────────────────────────────────
-    if extracted.get("ACTION_ITEMS"):
-        filepath = f"notes/actions/{date_str}-{_safe_filename(source)}-actions.md"
-        frontmatter = _build_note_frontmatter("action-items", source, timestamp)
-        items_md = "\n".join(f"- [ ] {item}" for item in extracted["ACTION_ITEMS"])
-        content = f"""{frontmatter}
+{context_str}
 
-# Action Items — {date_str}
-
-**Source:** `{source}`
-
-{items_md}
+## {date_str} · {source}
+{context_str}
 """
-        if push_file(filepath, content, f"{commit_prefix} | actions"):
+            commit_msg = f"entity({ekind}): create {eid}"
+
+        if push_file(filepath, doc, commit_msg):
             saved.append(filepath)
 
-    # ── 6. Session summary ───────────────────────────────────────────────────
-    if extracted.get("SUMMARY"):
-        filepath = f"notes/sessions/{date_str}-{_safe_filename(source)}-summary.md"
-        frontmatter = _build_note_frontmatter("session-summary", source, timestamp)
-
-        # Link to related notes
-        related = []
-        for f in saved:
-            label = f.split("/")[-1].replace(".md", "")
-            related.append(f"- [{label}](../{f})")
-        related_md = "\n".join(related) if related else "_none_"
-
-        content = f"""{frontmatter}
-
-# Session Summary — {source} · {date_str}
-
-{extracted["SUMMARY"]}
-
-## Captured Notes
-{related_md}
-
-## Stats
-- Insights: {len(extracted.get("KEY_INSIGHTS", []))}
-- Decisions: {len(extracted.get("DECISIONS", []))}
-- Open questions: {len(extracted.get("OPEN_QUESTIONS", []))}
-- Action items: {len(extracted.get("ACTION_ITEMS", []))}
-- People: {len(extracted.get("PEOPLE", []))}
-"""
-        if push_file(filepath, content, f"{commit_prefix} | summary"):
-            saved.append(filepath)
+    # ── 5. Update entity registry index ───────────────────────────────────────
+    _update_entity_registry(extracted.get("entities", []), captured_at)
 
     return saved
 
 
+def _update_entity_registry(entities: list[dict], captured_at: str):
+    """Update indexes/entity-registry.json with new entities."""
+    if not entities:
+        return
+
+    registry_path = "indexes/entity-registry.json"
+    existing_content = _get_existing_content(registry_path)
+
+    if existing_content:
+        try:
+            registry = json.loads(existing_content)
+        except Exception:
+            registry = {}
+    else:
+        registry = {}
+
+    changed = False
+    for entity in entities:
+        eid = entity.get("id", "")
+        if not eid:
+            continue
+        if eid not in registry:
+            registry[eid] = {
+                "id": eid,
+                "kind": entity.get("kind", ""),
+                "name": entity.get("name", ""),
+                "aliases": entity.get("aliases", []),
+                "first_seen": captured_at,
+            }
+            changed = True
+        else:
+            # Add new aliases
+            existing_aliases = set(registry[eid].get("aliases", []))
+            new_aliases = set(entity.get("aliases", []))
+            if new_aliases - existing_aliases:
+                registry[eid]["aliases"] = list(existing_aliases | new_aliases)
+                changed = True
+
+    if changed:
+        push_file(
+            registry_path,
+            json.dumps(registry, indent=2, ensure_ascii=False),
+            f"index: update entity-registry ({len(entities)} entities)"
+        )
+
+
+# ── GitHub Issues for open questions ──────────────────────────────────────────
+
 def open_github_issue(title: str, body: str, labels: list[str] = None) -> Optional[str]:
-    """
-    Open a GitHub Issue for an open question.
-    Returns the issue URL or None on failure.
-    """
     url = f"{GITHUB_API}/repos/{CORTEX_REPO}/issues"
     payload = {
         "title": title,
@@ -250,45 +359,37 @@ def open_github_issue(title: str, body: str, labels: list[str] = None) -> Option
     return None
 
 
-def _person_note(name: str, context: str, source: str, timestamp: str) -> str:
-    frontmatter = _build_note_frontmatter("person", source, timestamp, {"name": name})
-    return f"""{frontmatter}
-
-# {name}
-
-## {timestamp} · {source}
-{context}
-"""
-
-
 # ── Repo initialisation ───────────────────────────────────────────────────────
 
 def init_repo_structure() -> list[str]:
-    """
-    Create the base folder structure in the GitHub repo by pushing .gitkeep files.
-    Run this once on first setup.
-    """
+    """Create the v2 folder structure with .gitkeep files."""
     folders = [
-        "notes/insights",
-        "notes/decisions",
-        "notes/questions",
-        "notes/people",
-        "notes/actions",
-        "notes/sessions",
-        "notes/projects",
+        "sources",
+        "records",
+        "entities/people",
+        "entities/projects",
+        "entities/orgs",
+        "knowledge/decisions",
+        "knowledge/facts",
+        "tasks/open",
+        "tasks/resolved",
+        "views",
+        "indexes",
+        "governance",
+        "archive",
     ]
     created = []
     for folder in folders:
         filepath = f"{folder}/.gitkeep"
-        if push_file(filepath, "", f"init: create {folder}"):
+        if push_file(filepath, "", f"init: create {folder}/"):
             created.append(folder)
-            print(f"  ✅ {folder}")
+            print(f"  ✅ {folder}/")
         else:
-            print(f"  ⚠️  {folder} (already exists or error)")
+            print(f"  ⚠️  {folder}/ (already exists or error)")
     return created
 
 
 if __name__ == "__main__":
-    print("Initialising Cortex repo structure...")
+    print("Initialising Cortex repo structure (v2)...")
     init_repo_structure()
     print("Done. Check your GitHub repo.")
