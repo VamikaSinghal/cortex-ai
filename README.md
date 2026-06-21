@@ -134,4 +134,4 @@ See [SETUP.md](SETUP.md) for the full step-by-step guide including Claude Deskto
 
 ## Team
 
-Built by Vamika Singhal, Aaron, Vincent, Ibrahim at UC Berkeley AI Hackathon 2026.
+Built by Vamika Singhal at UC Berkeley AI Hackathon 2026.
