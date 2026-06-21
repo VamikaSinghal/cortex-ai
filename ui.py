@@ -10,10 +10,13 @@ import os
 import streamlit as st
 from datetime import datetime
 from dotenv import load_dotenv
-from anthropic import Anthropic
 
 load_dotenv()
 
+from instrumentation import setup_tracing
+setup_tracing(project_name="cortex")
+
+from anthropic import Anthropic
 from redis_store import search_context, get_recent_context
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))

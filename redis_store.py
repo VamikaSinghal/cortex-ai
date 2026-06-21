@@ -23,6 +23,9 @@ import os
 import struct
 from datetime import datetime
 from typing import Optional
+from opentelemetry import trace
+
+_tracer = trace.get_tracer("cortex.redis")
 
 import redis
 from redis.commands.search.field import TextField, VectorField, TagField, NumericField
@@ -256,6 +259,7 @@ def search_context(
     min_importance: int = None,
     topics: list[str] = None,
     entity_id: str = None,
+    _span_name: str = "cortex.retrieval",
 ) -> list[dict]:
     """
     Multi-strategy semantic search with optional metadata filters.
@@ -269,6 +273,34 @@ def search_context(
         topics:         Filter by topic tags
         entity_id:      Filter by entity ID
     """
+    with _tracer.start_as_current_span(_span_name) as span:
+        span.set_attribute("input.value", query)
+        span.set_attribute("cortex.top_k", top_k)
+        if kind:
+            span.set_attribute("cortex.filter.kind", kind)
+        if min_importance:
+            span.set_attribute("cortex.filter.min_importance", min_importance)
+
+        results = _search_context_inner(
+            query=query, top_k=top_k, kind=kind, status=status,
+            min_importance=min_importance, topics=topics, entity_id=entity_id,
+        )
+
+        span.set_attribute("cortex.results_count", len(results))
+        if results:
+            span.set_attribute("output.value", " | ".join(r.get("content", "")[:80] for r in results[:3]))
+        return results
+
+
+def _search_context_inner(
+    query: str,
+    top_k: int = 5,
+    kind: str = None,
+    status: str = None,
+    min_importance: int = None,
+    topics: list[str] = None,
+    entity_id: str = None,
+) -> list[dict]:
     r = _redis()
     embedding = _embed(query)
     embedding_bytes = _pack_embedding(embedding)

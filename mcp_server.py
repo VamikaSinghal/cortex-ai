@@ -23,6 +23,11 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 
+# Initialize Arize tracing before anything else
+from instrumentation import setup_tracing, get_tracer
+setup_tracing(project_name="cortex")
+_tracer = get_tracer()
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
@@ -224,6 +229,9 @@ async def list_tools() -> list[types.Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    with _tracer.start_as_current_span(f"cortex.tool.{name}") as span:
+        span.set_attribute("cortex.tool", name)
+        span.set_attribute("input.value", str(arguments)[:500])
     try:
         if name == "save_to_cortex":
             return await _save_to_cortex(arguments)

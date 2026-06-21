@@ -13,9 +13,16 @@ import json
 import re
 import os
 from datetime import datetime
+
+# Initialize Arize tracing BEFORE creating Anthropic client
+# so auto-instrumentation can wrap the client at import time
+from instrumentation import setup_tracing, get_tracer
+setup_tracing(project_name="cortex")
+
 from anthropic import Anthropic
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+_tracer = get_tracer()
 
 
 EXTRACTION_SYSTEM_PROMPT = """You are a context extraction engine for Cortex, a personal second brain.
