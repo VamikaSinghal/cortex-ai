@@ -1,4 +1,4 @@
-# 🧠 Cortex — Universal Context Layer
+# Cortex - Universal Context Layer
 
 > *One layer. Every AI knows you.*
 
